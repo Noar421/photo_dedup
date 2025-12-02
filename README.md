@@ -1,142 +1,156 @@
 # photo-dedup
 
-A fast photo & video deduplication tool using Python + SQLite + xxhash. Scans folders, stores file hashes in an SQLite DB, and helps find/export duplicate photos and videos. Includes folder similarity analysis and per-folder statistics.
+A fast photo & video deduplication tool using Python + SQLite + xxhash. It scans folders, stores file hashes in an SQLite DB, and helps find/export duplicate photos and videos. It also provides per-folder summaries and folder-similarity analysis.
 
-## Features
-- Scan folders and index file hashes into an SQLite database.
-- Detect duplicate photos and videos.
-- Export duplicate reports to CSV.
-- Per-folder summary with duplicate counts.
-- Folder similarity analysis (based on sets of file hashes).
-- Command-line interface with configurable logging and multi-threaded hashing.
+## Highlights
+- Fast multi-threaded hashing with xxhash
+- Small, portable SQLite database to store indexed files
+- Detects duplicate photos and videos and exports CSV reports
+- Per-folder duplicate summaries and folder-to-folder similarity analysis
+- Simple command-line interface with configurable logging
 
 ## Requirements
 - Python 3.8+
 - click
 - xxhash
-- (Other dependencies may be listed in requirements.txt)
-
-Install:
-- If repository includes requirements.txt:
-  pip install -r requirements.txt
-- Or install minimal runtime deps:
-  pip install click xxhash
+- (See requirements.txt for full dependency list)
 
 ## Installation
-Clone the repo:
+1. Clone the repo:
 
     git clone https://github.com/Noar421/photo_dedup.git
     cd photo_dedup
 
-Run via Python:
+2. Install dependencies:
 
-    python -m photo_dedup.photo_dedup [COMMAND] [OPTIONS]
+    pip install -r requirements.txt
 
-You can also add a console script entrypoint if desired.
+or for minimal runtime:
 
-## Basic usage
-Global options (apply when running the top-level command):
+    pip install click xxhash
 
-- --log-file PATH       Path to log file. If not set, defaults next to DB.
-- --no-file-log         Disable file logging entirely.
+## Running
+- This project is intended to be used as a script (top-level photo_dedup.py) and not as an importable module.
+- Run with Python:
 
-Commands:
-- scan [FOLDERS...]           Scan one or more folders and index files into the DB.
-- dedup                      Find duplicate photos and videos and optionally export a report.
-- list                       List all files in the database.
-- report                     Show global and per-folder duplicate statistics.
-- folder-summary             List folders and duplicate counts (can export to CSV).
-- folder-similar             Detect folders with similar content (based on shared hashes).
+    python photo_dedup.py [COMMAND] [OPTIONS]
 
-## Command examples and options
+- Or make the script executable and run directly:
 
-1) Scan
+    chmod +x photo_dedup.py
+    ./photo_dedup.py [COMMAND] [OPTIONS]
 
-Scan folders and index files:
+## Global options
+- --db-path PATH         Path for DB (directory containing DB; current dir if not specified)
+- --log-file PATH        Path to log file. If not set, defaults next to DB
+- --no-file-log          Disable file logging entirely
 
-    photo-dedup scan "/path/to/Photos"
+## Commands
 
-Options:
-- --db-path PATH              Path for DB (directory containing DB; current dir if not specified)
-- --folder-list PATH          Text file containing folder paths to scan (one per line)
-- --batch N                   DB commit batch size (default 200)
-- --threads N                 Number of hashing threads (default 4)
-- --fresh                     Delete DB and perform a full clean scan
-- --no-file-log               Disable file logging for this run
+1) scan
 
-Examples:
+- Description: Index files by hashing and store metadata in the SQLite DB.
+- Usage:
 
-    photo-dedup scan "/home/user/Pictures" --threads 8
-    photo-dedup scan --folder-list my_folders.txt --fresh
+    python photo_dedup.py scan "/path/to/Photos"
 
-2) Dedup
+    or
 
-Find duplicates and optionally export a CSV report.
+    ./photo_dedup.py scan "/path/to/Photos"
 
-Options:
-- --db-path PATH
-- --export PATH               Export duplicates report to CSV
-- --keep {first,largest,newest}
-- --no-file-log
+- Options:
+  --db-path PATH
+  --folder-list PATH      Text file containing folder paths to scan (one per line)
+  --batch N               DB commit batch size (default 200)
+  --threads N             Number of hashing threads (default 4)
+  --fresh                 Delete DB and perform a full clean scan
+  --no-file-log
 
-The --keep option determines which file of a duplicate group is considered the "master":
-- first — keep the first seen entry (default)
-- largest — keep the largest file
-- newest — keep the newest file (based on ctime where available)
+- Examples:
 
-CSV export fields: type, hash, master, duplicate, size
+    python photo_dedup.py scan "/home/user/Pictures" --threads 8
+    python photo_dedup.py scan --folder-list my_folders.txt --fresh
 
-Example:
+2) dedup
 
-    photo-dedup dedup --export duplicates.csv --keep largest
+- Description: Find duplicate files and optionally export a report.
+- Usage:
 
-3) Folder summary
+    python photo_dedup.py dedup
 
-List folders with total files and duplicate counts.
+- Options:
+  --db-path PATH
+  --export PATH           Export duplicates report to CSV
+  --keep {first,largest,newest}
+  --no-file-log
 
-Options:
-- --db-path PATH
-- --export PATH               Export folder summary to CSV (folder, total_files, duplicate_files)
-- --no-file-log
+- Keep options:
+  - first — keep the first seen entry (default)
+  - largest — keep the largest file
+  - newest — keep the newest file (based on ctime where available)
 
-Example:
+- CSV export fields: type, hash, master, duplicate, size
 
-    photo-dedup folder-summary --export folder_summary.csv
+- Example:
 
-4) Folder similarity
+    python photo_dedup.py dedup --export duplicates.csv --keep largest
 
-Detect folders with similar content based on shared file hashes. Similarity = intersection / union of hash sets.
+3) folder-summary
 
-Options:
-- --db-path PATH
-- --export PATH               Export similarity report to CSV (folder1, folder2, similarity, intersection, union)
-- --threshold FLOAT           Minimum similarity score (0–1) to display (default 0.5)
-- --no-file-log
+- Description: List folders with total files and duplicate counts
+- Usage:
 
-Example:
+    python photo_dedup.py folder-summary
 
-    photo-dedup folder-similar --threshold 0.3 --export similarity.csv
+- Options:
+  --db-path PATH
+  --export PATH           Export folder summary to CSV (folder, total_files, duplicate_files)
+  --no-file-log
 
-5) List
+- Example:
 
-List all files recorded in the DB:
+    python photo_dedup.py folder-summary --export folder_summary.csv
 
-    photo-dedup list
+4) folder-similar
 
-6) Report
+- Description: Detect folders with similar content based on shared file hashes.
+- Similarity = intersection_size / union_size
+- Usage:
 
-Show global and per-folder duplicate statistics (counts and lost space estimates):
+    python photo_dedup.py folder-similar
 
-    photo-dedup report
+- Options:
+  --db-path PATH
+  --export PATH           Export similarity report to CSV (folder1, folder2, similarity, intersection, union)
+  --threshold FLOAT       Minimum similarity score (0–1) to display (default 0.5)
+  --no-file-log
+
+- Example:
+
+    python photo_dedup.py folder-similar --threshold 0.3 --export similarity.csv
+
+5) list
+
+- Description: List all files recorded in the DB
+- Usage:
+
+    python photo_dedup.py list
+
+6) report
+
+- Description: Show global and per-folder duplicate statistics (counts and lost space estimates)
+- Usage:
+
+    python photo_dedup.py report
 
 ## Logging
-- By default logs are written to console and (unless disabled) to a file next to the DB.
+- By default logs are written to console and, unless disabled, to a file next to the DB.
 - Use --log-file to specify a custom log file.
 - Use --no-file-log to disable writing log files.
 
 ## Database
 - Uses an SQLite DB to store indexed file metadata and hashes.
-- The DB path can be set with --db-path. If not provided, DB is created in the current directory.
+- The DB path can be set with --db-path. If not provided, the DB is created in the current directory.
 - Use --fresh on scan to delete and recreate the DB before indexing.
 
 ## CSV Export formats
@@ -144,10 +158,28 @@ Show global and per-folder duplicate statistics (counts and lost space estimates
 - Folder summary (folder-summary --export): columns - folder, total_files, duplicate_files
 - Folder similarity (folder-similar --export): columns - folder1, folder2, similarity, intersection, union
 
-## Notes
+## Notes & Tips
 - The tool differentiates photos and videos where possible (see db module for how file types are classified).
-- Hashing is multi-threaded; increase --threads for faster hashing on many-core machines.
-- The script exposes logging configuration options and will create a timestamped log file when scanning.
+- Increase --threads for faster hashing on many-core machines.
+- Hashing is multi-threaded; batch DB commits with --batch to tune performance.
+- The default --keep strategy is 'first' to preserve the first-seen file; pick largest/newest to preserve file properties you care about.
+- Test a small folder first to confirm behavior before running large scans.
 
 ## Contributing
-Contributions, bug reports and PRs are welcome. Please open an issue describing the problem or feature first.
+- Contributions, bug reports, and PRs are welcome. Please open an issue describing the problem or feature before sending a PR.
+- Suggested workflow:
+  1. Fork the repo
+  2. Create a topic branch (e.g., update-readme)
+  3. Open a pull request with a clear description of changes
+
+## License
+- Add your license here (e.g., MIT). If you want me to add a license file, tell me which license to use.
+
+## Contact
+- Maintainer: Noar421 (GitHub)
+- Open an issue for bugs or feature requests.
+
+## Changelog / TODO (optional)
+- Add CI (pytest, lint)
+- Package for pip with console entrypoint (if you later want one)
+- Add progress reporting and resume support for very large scans
