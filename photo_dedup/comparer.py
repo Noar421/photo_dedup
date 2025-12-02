@@ -1,5 +1,5 @@
 # comparer.py
-from database import get_connection
+from db import get_connection
 
 def find_exact_duplicates():
     conn = get_connection()

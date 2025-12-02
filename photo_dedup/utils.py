@@ -3,9 +3,12 @@ from PIL.ExifTags import TAGS, GPSTAGS
 
 
 def human_size(num):
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+    for unit in ["B ", "KB", "MB", "GB", "TB"]:
         if num < 1024:
-            return f"{num:.1f}{unit}"
+            ret = f"{num:6.1f}"
+            ret = ret.rjust(6)
+            ret +=  f" {unit}"
+            return ret
         num /= 1024
 
 from PIL import Image

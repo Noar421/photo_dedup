@@ -1,8 +1,8 @@
 import click
 from pathlib import Path
-from .scanner import scan_folder
-from .db import Database
-from .utils import human_size
+from scanner import scan_folder
+from db import Database
+from utils import human_size
 import logging
 import csv
 
@@ -45,9 +45,9 @@ def main(ctx, log_file, no_file_log):
 @click.pass_context
 def scan(ctx, folders, db_path, folder_list, batch, threads, fresh, no_file_log):
     """Scan a list of folders and store hashes of files in database"""
-    from .logger_setup import setup_logger
-    from .scanner import scan_folder
-    from .db import Database
+    from logger_setup import setup_logger
+    from scanner import scan_folder
+    from db import Database
     import os
 
     # Normal DB open (or new DB created here)
@@ -115,10 +115,10 @@ def scan(ctx, folders, db_path, folder_list, batch, threads, fresh, no_file_log)
 @click.option("--no-file-log", is_flag=True, help="Disable file logging")
 @click.pass_context
 def dedup(ctx, db_path, export, keep, no_file_log):
-    from .logger_setup import setup_logger
-    from .db import Database
+    from logger_setup import setup_logger
+    from db import Database
     import csv
-    from .utils import human_size
+    from utils import human_size
     from pathlib import Path
 
     db = Database(db_path)
@@ -203,8 +203,8 @@ def dedup(ctx, db_path, export, keep, no_file_log):
 def folder_summary(ctx, db_path, export, no_file_log):
     """List all folders from database and show duplicates count"""
 
-    from .logger_setup import setup_logger
-    from .db import Database
+    from logger_setup import setup_logger
+    from db import Database
     from pathlib import Path
     from collections import defaultdict
     import csv
@@ -258,8 +258,8 @@ def folder_similar(ctx, db_path, export, threshold, no_file_log):
     Similarity = intersection / union of file-hash sets.
     """
 
-    from .logger_setup import setup_logger
-    from .db import Database
+    from logger_setup import setup_logger
+    from db import Database
     from pathlib import Path
     import csv
     from collections import defaultdict
@@ -276,7 +276,11 @@ def folder_similar(ctx, db_path, export, threshold, no_file_log):
     # 1) Build mapping: folder_path → set of hashes
     try:
         folder_hashes = defaultdict(set)
-        for row in db.list_all():
+        for row in db.list_all_photos():
+            folder = str(Path(row["path"]).parent)
+            if row["hash"]:
+                folder_hashes[folder].add(row["hash"])
+        for row in db.list_all_videos():
             folder = str(Path(row["path"]).parent)
             if row["hash"]:
                 folder_hashes[folder].add(row["hash"])
@@ -357,9 +361,9 @@ def list(ctx, db_path):
 def report(ctx, db_path, no_file_log):
     """Show global and per-folder duplicate statistics for photos and videos."""
 
-    from .logger_setup import setup_logger
-    from .db import Database
-    from .utils import human_size
+    from logger_setup import setup_logger
+    from db import Database
+    from utils import human_size
 
     db = Database(db_path)
 
@@ -374,14 +378,14 @@ def report(ctx, db_path, no_file_log):
     # --- Global statistics ---
     stats = db.get_global_stats()
     logger.info("=== Global Statistics ===")
-    logger.info(f"Photos:              {stats['total_files_photos']} files")
-    logger.info(f"  Total size:        {human_size(stats['total_size_photos'])}")
-    logger.info(f"  Duplicate groups:  {stats['duplicate_photo_groups']}")
-    logger.info(f"  Lost space:        {human_size(stats['lost_space_photos'])}")
-    logger.info(f"Videos:              {stats['total_files_videos']} files")
-    logger.info(f"  Total size:        {human_size(stats['total_size_videos'])}")
-    logger.info(f"  Duplicate groups:  {stats['duplicate_video_groups']}")
-    logger.info(f"  Lost space:        {human_size(stats['lost_space_videos'])}")
+    logger.info(f"Photos:              {str(stats['total_files_photos']).rjust(7)} files")
+    logger.info(f"  Total size:        {human_size(stats['total_size_photos']).rjust(10)}")
+    logger.info(f"  Duplicate groups:  {str(stats['duplicate_photo_groups']).rjust(7)}")
+    logger.info(f"  Lost space:        {human_size(stats['lost_space_photos']).rjust(10)}")
+    logger.info(f"Videos:              {str(stats['total_files_videos']).rjust(7)} files")
+    logger.info(f"  Total size:        {human_size(stats['total_size_videos']).rjust(10)}")
+    logger.info(f"  Duplicate groups:  {str(stats['duplicate_video_groups']).rjust(7)}")
+    logger.info(f"  Lost space:        {human_size(stats['lost_space_videos']).rjust(10)}")
     logger.info("")
 
     # --- Per-folder statistics ---
@@ -407,3 +411,8 @@ def report(ctx, db_path, no_file_log):
     logger.info("====================================")
     logger.info("            REPORT END")
     logger.info("====================================")
+
+
+
+if __name__ == "__main__":
+    main()
