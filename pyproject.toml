@@ -1,12 +1,12 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "photo-dedup"
 version = "0.1.0"
 description = "CLI tool to detect duplicate photos efficiently"
-authors = [{name="You"}]
+authors = [{name = "You"}]
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
@@ -16,4 +16,20 @@ dependencies = [
 ]
 
 [project.scripts]
-photo-dedup = "photo_dedup.cli:main"
+photo-dedup = "photo_dedup:main"
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=5.0",
+    "wheel",
+]
+
+[tool.setuptools]
+py-modules = ["photo_dedup"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"photo_dedup" = [
+  "data/*",
+  "templates/*",
+]
