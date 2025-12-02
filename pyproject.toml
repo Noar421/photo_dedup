@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "photo-dedup"
+version = "0.1.0"
+description = "CLI tool to detect duplicate photos efficiently"
+authors = [{name="You"}]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "click",
+    "Pillow",
+    "xxhash",
+]
+
+[project.scripts]
+photo-dedup = "photo_dedup.cli:main"
