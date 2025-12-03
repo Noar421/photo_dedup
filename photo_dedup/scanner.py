@@ -7,12 +7,11 @@ from utils import extract_exif
 
 # Allowed photo extensions
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tiff", ".bmp"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".wma", "mpeg4"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp", ".wmv", ".mpeg4"}
 
 # Global logger
 logger = logging.getLogger("photo_dedup")
 logger.setLevel(logging.INFO)
-
 
 def setup_console_logging():
     if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):

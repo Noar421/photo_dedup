@@ -75,7 +75,7 @@ def scan(ctx, folders, db_path, folder_list, batch, threads, fresh, no_file_log)
             os.remove(db_path)
 
         # Recreate empty DB
-        db = Database()
+        db = Database(db_path)
 
     # Combine folders from CLI args and folder list file
     if folder_list:
@@ -217,11 +217,25 @@ def folder_summary(ctx, db_path, export, no_file_log):
     dup_paths = set(f["path"] for files in groups.values() for f in files[1:])
 
     folder_info = defaultdict(lambda: {"total": 0, "dups": 0})
-    for row in db.list_all():
+
+    for row in db.list_all_photos():
         folder = str(Path(row["path"]).parent)
         folder_info[folder]["total"] += 1
         if row["path"] in dup_paths:
             folder_info[folder]["dups"] += 1
+
+    for row in db.list_all_videos():
+        folder = str(Path(row["path"]).parent)
+        if (folder not in folder_info.keys()):
+            folder_info[folder]["total"] += 1
+        if row["path"] in dup_paths:
+            folder_info[folder]["dups"] += 1
+
+    # for row in db.list_all():
+    #     folder = str(Path(row["path"]).parent)
+    #     folder_info[folder]["total"] += 1
+    #     if row["path"] in dup_paths:
+    #         folder_info[folder]["dups"] += 1
 
     max_len = max(len(f) for f in folder_info.keys())
     logger.info("=== Folder Summary with Duplicates ===")
@@ -346,10 +360,16 @@ def folder_similar(ctx, db_path, export, threshold, no_file_log):
 def list(ctx, db_path):
     """List all files in DB."""
     db = Database(db_path)
-    rows = db.list_all()
+    photos_rows = db.list_all_photos()
+    videos_rows = db.list_all_videos()
 
-    for r in rows:
-        click.echo(f"{r['id']:6} | {human_size(r['size']):10} | {r['path']}")
+    logger.info(f"Photos : {photos_rows.count()} : files")
+    for r in photos_rows:
+        logger.info(f"{r['id']:6} | {human_size(r['size']):10} | {r['path']}")
+
+    logger.info(f"Photos : {videos_rows.count()} : files")
+    for r in videos_rows:
+        logger.info(f"{r['id']:6} | {human_size(r['size']):10} | {r['path']}")
 
 #==============================================================================================
 # Report

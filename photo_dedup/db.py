@@ -52,6 +52,12 @@ class Database:
         );
         """)
 
+        # Create tables indexes
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_hash ON photos(hash);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_hash ON videos(hash);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_folder ON videos(folder);")
+
         self.conn.commit()
 
     # ---------------------------
@@ -108,9 +114,6 @@ class Database:
             "INSERT OR IGNORE INTO videos(path, folder, size, hash) VALUES (?, ?, ?, ?)",
             data
         )
-
-    def commit(self):
-        self.conn.commit()
 
     # ---------------------------
     # Basic Queries
@@ -273,6 +276,10 @@ class Database:
             folder = str(Path(r["path"]).parent)
             folder_map.setdefault(folder, set()).add(r["hash"])
         return folder_map
+
+
+    def commit(self):
+        self.conn.commit()
 
     def close(self):
         self.conn.close()
