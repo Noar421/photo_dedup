@@ -8,7 +8,7 @@ def setup_logger(db_path=None, log_file=None, no_file_log=False):
     Returns the logger instance.
     """
     logger = logging.getLogger("photo_dedup")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     # Remove all existing handlers first (reset logger)
     if logger.hasHandlers():

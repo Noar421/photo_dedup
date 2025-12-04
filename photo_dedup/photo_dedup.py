@@ -1,438 +1,725 @@
+#!/usr/bin/env python3
+"""
+Photo Deduplication Tool
+
+A CLI tool for detecting and managing duplicate photos and videos
+using content-based hashing.
+"""
+
 import click
-from pathlib import Path
-from scanner import scan_folder
-from db import Database
-from utils import human_size
-import logging
+import sys
+import os
 import csv
+import logging
+from pathlib import Path
+from typing import List, Dict, Optional
 
-# Configure console logging globally
+from scanner import FileScanner, ScanError
+from db import Database, DatabaseError
+from utils import human_size, validate_threshold
+from logger_setup import setup_logger
+
+# Version
+__version__ = "0.2.0"
+
+# Global logger (will be configured by commands)
 logger = logging.getLogger("photo_dedup")
-logger.setLevel(logging.INFO)
-if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
-    console_handler = logging.StreamHandler()
-    console_formatter = logging.Formatter("[%(asctime)s] %(message)s", "%H:%M:%S")
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
 
 
-#==============================================================================================
-# Main
-#==============================================================================================
+# ==============================================================================================
+# Helper Functions
+# ==============================================================================================
+
+def get_database(ctx, db_path: Optional[str] = None) -> Database:
+    """
+    Get or create database instance.
+    
+    Args:
+        ctx: Click context
+        db_path: Optional database directory path
+        
+    Returns:
+        Database instance
+    """
+    try:
+        logger.debug(f"[get_database] : Initialize database")
+        db = Database(db_path)
+        ctx.obj["db"] = db
+        return db
+
+    except DatabaseError as e:
+        logger.error(f"Failed to initialize database: {e}")
+        click.echo(f"Error: Failed to initialize database: {e}", err=True)
+        sys.exit(1)
+
+
+def setup_logging(ctx, db_path: Optional[Path] = None, no_file_log: bool = False):
+    """
+    Setup logging for the command.
+    
+    Args:
+        ctx: Click context
+        db_path: Database path for log file location
+        no_file_log: Disable file logging
+    """
+    log_file = ctx.obj.get("log_file")
+    global logger
+    logger = setup_logger(db_path=db_path, log_file=log_file, no_file_log=no_file_log)
+
+
+def read_folder_list(file_path: str) -> List[str]:
+    """
+    Read folder paths from a text file.
+    
+    Args:
+        file_path: Path to text file with one folder per line
+        
+    Returns:
+        List of folder paths
+    """
+    folders = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):  # Skip empty and comment lines
+                    folders.append(line)
+        return folders
+    except FileNotFoundError:
+        logger.error(f"Folder list file not found: {file_path}")
+        click.echo(f"Error: File not found: {file_path}", err=True)
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to read folder list: {e}")
+        click.echo(f"Error: Failed to read folder list: {e}", err=True)
+        sys.exit(1)
+
+
+def select_master_file(files: List[Dict], keep_strategy: str) -> Dict:
+    """
+    Select which file to keep as master based on strategy.
+    
+    Args:
+        files: List of duplicate file records
+        keep_strategy: Strategy ('first', 'largest', 'newest')
+        
+    Returns:
+        Selected master file record
+    """
+    if keep_strategy == "largest":
+        return max(files, key=lambda f: f["size"])
+    elif keep_strategy == "newest":
+        # Use date_taken if available (photos), otherwise use first
+        dated_files = [f for f in files if f.get("date_taken")]
+        if dated_files:
+            return max(dated_files, key=lambda f: f["date_taken"])
+        return files[0]
+    else:  # 'first'
+        return files[0]
+
+
+def process_duplicates(groups: Dict[str, List[Dict]], file_type: str, keep_strategy: str) -> List[Dict]:
+    """
+    Process duplicate groups and generate report rows.
+    
+    Args:
+        groups: Dictionary of hash -> list of files
+        file_type: Type of files ('photo' or 'video')
+        keep_strategy: Which file to keep ('first', 'largest', 'newest')
+        
+    Returns:
+        List of rows for CSV export
+    """
+    rows = []
+    
+    for hash_value, files in groups.items():
+        master = select_master_file(files, keep_strategy)
+        
+        logger.info(f"Hash: {hash_value}")
+        logger.info(f"  KEEP -> {master['path']} ({human_size(master['size'])})")
+        
+        for f in files:
+            if f["path"] != master["path"]:
+                logger.info(f"  DUP  -> {f['path']} ({human_size(f['size'])})")
+                rows.append({
+                    "type": file_type,
+                    "hash": hash_value,
+                    "master": master["path"],
+                    "duplicate": f["path"],
+                    "size": f["size"]
+                })
+    
+    return rows
+
+
+# ==============================================================================================
+# Main CLI Group
+# ==============================================================================================
+
 @click.group()
+@click.version_option(version=__version__)
 @click.option("--log-file", type=click.Path(), default=None,
               help="Path to log file. If not set, defaults next to DB.")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging entirely.")
+@click.option("--no-file-log", is_flag=True, 
+              help="Disable file logging entirely.")
 @click.pass_context
 def main(ctx, log_file, no_file_log):
-    """Photo Deduplication Tool"""
+    """
+    Photo Deduplication Tool
+    
+    A fast tool for detecting duplicate photos and videos using content hashing.
+    """
     ctx.ensure_object(dict)
     ctx.obj["log_file"] = log_file
     ctx.obj["no_file_log"] = no_file_log
+    ctx.obj["db"] = None
 
-#==============================================================================================
-# Scan
-#==============================================================================================
+# ==============================================================================================
+# Scan Command
+# ==============================================================================================
+
 @main.command()
 @click.argument("folders", type=click.Path(exists=True), nargs=-1)
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), 
+              help="Directory for database (current directory if not specified)")
 @click.option("--folder-list", type=click.Path(exists=True),
-              help="Text file with folder paths")
-@click.option("--batch", default=200, help="DB commit batch size")
-@click.option("--threads", default=4, help="Number of hashing threads")
-@click.option("--fresh", is_flag=True, help="Delete DB and perform a full clean scan")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging")
+              help="Text file with folder paths (one per line)")
+@click.option("--batch", default=200, type=click.IntRange(1, 10000),
+              help="Database commit batch size")
+@click.option("--threads", default=4, type=click.IntRange(1, 32),
+              help="Number of hashing threads")
+@click.option("--fresh", is_flag=True, 
+              help="Delete database and perform full clean scan")
 @click.pass_context
-def scan(ctx, folders, db_path, folder_list, batch, threads, fresh, no_file_log):
-    """Scan a list of folders and store hashes of files in database"""
-    from logger_setup import setup_logger
-    from scanner import scan_folder
-    from db import Database
-    import os
+def scan(ctx, folders, db_path, folder_list, batch, threads, fresh):
+    """
+    Scan folders and index photos/videos in database.
+    
+    FOLDERS: One or more folder paths to scan
+    
+    Example:
+        photo-dedup scan "/home/user/Pictures" --threads 8
+        photo-dedup scan --folder-list folders.txt --fresh
+    """
 
-    # Normal DB open (or new DB created here)
-    db = Database(db_path)
-
-    # Initialize logger with timestamped log file
-    global logger
-    logger = setup_logger(db_path=db.db_path, no_file_log=no_file_log)
-
-    # Handle fresh full reset
-    if fresh:
-        db_path = db.db_path
-        if os.path.exists(db_path):
-            logger.info("")
-            logger.info("===========================================")
-            logger.info("   FRESH SCAN REQUESTED — DELETING DB")
-            logger.info(f"   Removing existing database: {db_path}")
-            logger.info("===========================================")
-            logger.info("")
-
-            # CLOSE THE DATABASE BEFORE DELETING
-            if hasattr(db, "conn") and db.conn:
-                db.conn.close()
-
-            os.remove(db_path)
-
-        # Recreate empty DB
-        db = Database(db_path)
-
-    # Combine folders from CLI args and folder list file
+    # Combine folders from arguments and file
+    all_folders = list(folders)
     if folder_list:
-        with open(folder_list, "r", encoding="utf-8") as f:
-            file_folders = [line.strip() for line in f if line.strip()]
-        folders = folders + tuple(file_folders)
-
-    if not folders:
-        print("No folders specified for scanning.")
-        return
-
-    total_count = 0
-    for folder in folders:
-        folder = str(folder)
+        all_folders.extend(read_folder_list(folder_list))
+    
+    # if not all_folders:
+    if len(all_folders) == 0:
+        click.echo("Error: No folders specified for scanning.", err=True)
+        click.echo("Specify folders as arguments or use --folder-list option.")
+        sys.exit(1)
+    
+    # Validate all folders exist
+    for folder in all_folders:
+        if not Path(folder).exists():
+            click.echo(f"Error: Folder does not exist: {folder}", err=True)
+            sys.exit(1)
+    
+    # Handle fresh scan
+    if fresh:
+        if db_path:
+            db_file = Path(db_path) / "photo_dedup.db"
+        else:
+            db_file = Path.cwd() / "photo_dedup.db"
+        
+        if db_file.exists():
+            click.echo(f"\n{'='*60}")
+            click.echo("   FRESH SCAN REQUESTED — DELETING DATABASE")
+            click.echo(f"   Removing: {db_file}")
+            click.echo(f"{'='*60}\n")
+            
+            try:
+                os.remove(db_file)
+            except Exception as e:
+                click.echo(f"Error: Failed to delete database: {e}", err=True)
+                sys.exit(1)
+    
+    db = get_database(ctx, db_path)
+    setup_logging(ctx, db_path=db.db_path, no_file_log=ctx.obj.get("no_file_log", False))
+    
+    # Create scanner
+    scanner = FileScanner(db, batch_size=batch, threads=threads, skip_existing=not fresh)
+    
+    # Scan all folders
+    total_stats = {
+        "total_photos": 0,
+        "total_videos": 0,
+        "processed_photos": 0,
+        "processed_videos": 0,
+        "failed": 0,
+        "skipped": 0
+    }
+    
+    for folder in all_folders:
         logger.info("")
-        logger.info("===========================================")
-        logger.info(f"=== Starting scan for folder: {folder} ===")
-        logger.info("===========================================")
-        count = scan_folder(folder, db, batch_size=batch, threads=threads)
-        total_count += count
-        logger.info("")
-        logger.info("===========================================")
-        logger.info(f"=== Finished scan for folder: {folder} ===")
-        logger.info("===========================================")
+        logger.info("=" * 60)
+        logger.info(f"Scanning folder: {folder}")
+        logger.info("=" * 60)
+        
+        try:
+            stats = scanner.scan(folder)
+            total_stats["total_photos"] += stats.total_photos
+            total_stats["total_videos"] += stats.total_videos
+            total_stats["processed_photos"] += stats.processed_photos
+            total_stats["processed_videos"] += stats.processed_videos
+            total_stats["failed"] += stats.failed_files
+            total_stats["skipped"] += stats.skipped_files
+            
+        except ScanError as e:
+            logger.error(f"Failed to scan {folder}: {e}")
+            click.echo(f"Error scanning {folder}: {e}", err=True)
+    
+    # Print summary
+    click.echo("\n" + "=" * 60)
+    click.echo("SCAN COMPLETE - SUMMARY")
+    click.echo("=" * 60)
+    click.echo(f"Photos:    {total_stats['processed_photos']:6} / {total_stats['total_photos']:6} processed")
+    click.echo(f"Videos:    {total_stats['processed_videos']:6} / {total_stats['total_videos']:6} processed")
+    click.echo(f"Skipped:   {total_stats['skipped']:6} already indexed")
+    click.echo(f"Failed:    {total_stats['failed']:6}")
+    click.echo("=" * 60)
+    
+    db.close()
 
-    print("")
-    print("")
-    print(f"Total files indexed from all folders: {total_count}")
 
-#==============================================================================================
-# Dedup
-#==============================================================================================
+# ==============================================================================================
+# Dedup Command
+# ==============================================================================================
+
 @main.command()
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
-@click.option("--export", type=click.Path(), default=None, help="Export duplicates report to CSV")
-@click.option("--keep", type=click.Choice(["first", "largest", "newest"]), default="first")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging")
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
+@click.option("--export", type=click.Path(), default=None,
+              help="Export duplicates report to CSV")
+@click.option("--keep", type=click.Choice(["first", "largest", "newest"]), 
+              default="first", show_default=True,
+              help="Which file to keep: first seen, largest size, or newest")
 @click.pass_context
-def dedup(ctx, db_path, export, keep, no_file_log):
-    from logger_setup import setup_logger
-    from db import Database
-    import csv
-    from utils import human_size
-    from pathlib import Path
-
-    db = Database(db_path)
-    global logger
-    logger = setup_logger(db_path=db.db_path, no_file_log=no_file_log)
-    rows_to_export = []
-
-    logger.info("==============================================")
-    logger.info("=== Searching photos duplicates            ===")
-    logger.info("==============================================")
+def dedup(ctx, db_path, export, keep):
+    """
+    Find and report duplicate files.
+    
+    Identifies duplicate photos and videos based on content hash.
+    Optionally exports a CSV report with master/duplicate relationships.
+    
+    Example:
+        photo-dedup dedup --export duplicates.csv --keep largest
+    """
+    db = get_database(ctx, db_path)
+    setup_logging(ctx, db_path=db.db_path, no_file_log=ctx.obj.get("no_file_log", False))
+    
+    all_rows = []
+    
+    # Process photos
+    logger.info("=" * 60)
+    logger.info("Searching for duplicate photos...")
+    logger.info("=" * 60)
+    
     groups_photos = db.duplicate_photo_groups()
     if not groups_photos:
-        logger.info("No photos duplicates found.")
+        logger.info("No duplicate photos found.")
     else:
-        for h, files in groups_photos.items():
-            if keep == "largest":
-                master = max(files, key=lambda f: f["size"])
-            elif keep == "newest":
-                master = max(files, key=lambda f: f.get("ctime", 0))
-            else:
-                master = files[0]  # first
-
-            logger.info(f"Hash: {h}")
-            logger.info(f"  KEEP -> {master['path']} ({human_size(master['size'])})")
-
-            for f in files:
-                if f["path"] != master["path"]:
-                    logger.info(f"  DUP  -> {f['path']} ({human_size(f['size'])})")
-                    rows_to_export.append({
-                        "type":"photo",
-                        "hash": h,
-                        "master": master["path"],
-                        "duplicate": f["path"],
-                        "size": human_size(f['size'])
-                    })
+        logger.info(f"Found {len(groups_photos)} duplicate photo groups")
+        rows = process_duplicates(groups_photos, "photo", keep)
+        all_rows.extend(rows)
+    
+    # Process videos
     logger.info("")
-    logger.info("==============================================")
-    logger.info("=== Searching videos duplicates            ===")
-    logger.info("==============================================")
+    logger.info("=" * 60)
+    logger.info("Searching for duplicate videos...")
+    logger.info("=" * 60)
+    
     groups_videos = db.duplicate_video_groups()
-    if not groups_photos:
-        logger.info("No videos duplicates found.")
+    if not groups_videos:
+        logger.info("No duplicate videos found.")
     else:
-        for h, files in groups_videos.items():
-            if keep == "largest":
-                master = max(files, key=lambda f: f["size"])
-            elif keep == "newest":
-                master = max(files, key=lambda f: f.get("ctime", 0))
-            else:
-                master = files[0]  # first
+        logger.info(f"Found {len(groups_videos)} duplicate video groups")
+        rows = process_duplicates(groups_videos, "video", keep)
+        all_rows.extend(rows)
+    
+    # Summary
+    click.echo(f"\nFound {len(all_rows)} duplicate files")
+    click.echo(f"  Photos: {sum(1 for r in all_rows if r['type'] == 'photo')}")
+    click.echo(f"  Videos: {sum(1 for r in all_rows if r['type'] == 'video')}")
+    
+    # Export to CSV
+    if export and all_rows:
+        try:
+            export_path = Path(export)
+            with open(export_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["type", "hash", "master", "duplicate", "size"])
+                writer.writeheader()
+                writer.writerows(all_rows)
+            
+            logger.info(f"Duplicates report exported to {export_path}")
+            click.echo(f"Report exported to: {export_path}")
+        except Exception as e:
+            logger.error(f"Failed to export report: {e}")
+            click.echo(f"Error: Failed to export report: {e}", err=True)
+    
+    db.close()
 
-            logger.info(f"Hash: {h}")
-            logger.info(f"  KEEP -> {master['path']} ({human_size(master['size'])})")
 
-            for f in files:
-                if f["path"] != master["path"]:
-                    logger.info(f"  DUP  -> {f['path']} ({human_size(f['size'])})")
-                    rows_to_export.append({
-                        "type":"video",
-                        "hash": h,
-                        "master": master["path"],
-                        "duplicate": f["path"],
-                        "size": human_size(f['size'])
-                    })
+# ==============================================================================================
+# Folder Summary Command
+# ==============================================================================================
 
-    if export:
-        export_path = Path(export)
-        with open(export_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["type", "hash", "master", "duplicate", "size"])
-            writer.writeheader()
-            writer.writerows(rows_to_export)
-        logger.info(f"Duplicates report exported to {export_path}")
-
-#==============================================================================================
-# Folder summary
-#==============================================================================================
 @main.command()
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
-@click.option("--export", type=click.Path(), default=None, help="Export folder summary to CSV")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging")
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
+@click.option("--export", type=click.Path(), default=None,
+              help="Export folder summary to CSV")
 @click.pass_context
-def folder_summary(ctx, db_path, export, no_file_log):
-    """List all folders from database and show duplicates count"""
-
-    from logger_setup import setup_logger
-    from db import Database
-    from pathlib import Path
-    from collections import defaultdict
-    import csv
-
-    db = Database(db_path)
-    global logger
-    logger = setup_logger(db_path=db.db_path, no_file_log=no_file_log)
-
-    groups = db.duplicate_photo_groups()
-    dup_paths = set(f["path"] for files in groups.values() for f in files[1:])
-
-    folder_info = defaultdict(lambda: {"total": 0, "dups": 0})
-
-    for row in db.list_all_photos():
-        folder = str(Path(row["path"]).parent)
-        folder_info[folder]["total"] += 1
-        if row["path"] in dup_paths:
-            folder_info[folder]["dups"] += 1
-
-    for row in db.list_all_videos():
-        folder = str(Path(row["path"]).parent)
-        if (folder not in folder_info.keys()):
-            folder_info[folder]["total"] += 1
-        if row["path"] in dup_paths:
-            folder_info[folder]["dups"] += 1
-
-    # for row in db.list_all():
-    #     folder = str(Path(row["path"]).parent)
-    #     folder_info[folder]["total"] += 1
-    #     if row["path"] in dup_paths:
-    #         folder_info[folder]["dups"] += 1
-
-    max_len = max(len(f) for f in folder_info.keys())
-    logger.info("=== Folder Summary with Duplicates ===")
+def folder_summary(ctx, db_path, export):
+    """
+    Show summary of files and duplicates per folder.
+    
+    Lists all folders in the database with total file counts
+    and duplicate file counts.
+    
+    Example:
+        photo-dedup folder-summary --export folder_report.csv
+    """
+    db = get_database(ctx, db_path)
+    setup_logging(ctx, db_path=db.db_path, no_file_log=ctx.obj.get("no_file_log", False))
+    
+    logger.info("=" * 60)
+    logger.info("Generating folder summary...")
+    logger.info("=" * 60)
+    
+    folder_stats = db.get_folders_stats()
+    
+    if not folder_stats:
+        click.echo("No folders found in database.")
+        db.close()
+        return
+    
+    # Display summary
+    max_len = max(len(f) for f in folder_stats.keys())
+    
     logger.info("")
-    logger.info(f"{'Folder'.ljust(max_len)} | Total | Duplicates")
-    logger.info("-" * (max_len + 20))
-    for folder, info in folder_info.items():
-        logger.info(f"{folder.ljust(max_len)} | {info['total']:5} | {info['dups']:5}")
-    logger.info("======================================\n")
-
+    logger.info(f"{'Folder'.ljust(max_len)} | Photos | Photo Dups | Videos | Video Dups")
+    logger.info("-" * (max_len + 50))
+    
+    for folder, info in sorted(folder_stats.items()):
+        logger.info(
+            f"{folder.ljust(max_len)} | "
+            f"{str(info['photos_count']).rjust(6)} | "
+            f"{str(info['photos_dup_count']).rjust(10)} | "
+            f"{str(info['videos_count']).rjust(6)} | "
+            f"{str(info['videos_dup_count']).rjust(10)}"
+        )
+    
+    # Export to CSV
     if export:
-        export_path = Path(export)
-        with open(export_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["folder", "total_files", "duplicate_files"])
-            writer.writeheader()
-            for folder, info in folder_info.items():
-                writer.writerow({"folder": folder, "total_files": info["total"], "duplicate_files": info["dups"]})
-        logger.info(f"Folder summary exported to {export_path}")
+        try:
+            export_path = Path(export)
+            with open(export_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "folder", "total_photos", "duplicate_photos", 
+                    "total_videos", "duplicate_videos"
+                ])
+                writer.writeheader()
+                
+                for folder, info in folder_stats.items():
+                    writer.writerow({
+                        "folder": folder,
+                        "total_photos": info["photos_count"],
+                        "duplicate_photos": info["photos_dup_count"],
+                        "total_videos": info["videos_count"],
+                        "duplicate_videos": info["videos_dup_count"]
+                    })
+            
+            logger.info(f"Folder summary exported to {export_path}")
+            click.echo(f"Report exported to: {export_path}")
+        except Exception as e:
+            logger.error(f"Failed to export report: {e}")
+            click.echo(f"Error: Failed to export report: {e}", err=True)
+    
+    db.close()
 
-#==============================================================================================
-# Folder similarity detection
-#==============================================================================================
-@main.command(context_settings=dict(ignore_unknown_options=True))
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
+
+# ==============================================================================================
+# Folder Similarity Command
+# ==============================================================================================
+
+@main.command()
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
 @click.option("--export", type=click.Path(), default=None,
               help="Export similarity report to CSV")
-@click.option("--threshold", default=0.5, show_default=True,
-              help="Minimum similarity score (0–1) to display")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging")
+@click.option("--threshold", default=0.5, type=click.FloatRange(0.0, 1.0),
+              show_default=True,
+              help="Minimum similarity score (0-1) to display")
 @click.pass_context
-def folder_similar(ctx, db_path, export, threshold, no_file_log):
+def folder_similar(ctx, db_path, export, threshold):
     """
-    Detect folders with similar content based on file hashes.
-    Similarity = intersection / union of file-hash sets.
+    Detect folders with similar content based on shared files.
+    
+    Calculates similarity between folder pairs using Jaccard similarity
+    (intersection / union of file hashes).
+    
+    Example:
+        photo-dedup folder-similar --threshold 0.3
     """
-
-    from logger_setup import setup_logger
-    from db import Database
-    from pathlib import Path
-    import csv
-    from collections import defaultdict
-
-    db = Database(db_path)
-    global logger
-    logger = setup_logger(db_path=db.db_path, no_file_log=no_file_log)
-
+    db = get_database(ctx, db_path)
+    setup_logging(ctx, db_path=db.db_path, no_file_log=ctx.obj.get("no_file_log", False))
+    
     logger.info("")
-    logger.info("===========================================")
-    logger.info("=== Folder Similarity Analysis Started ===")
-    logger.info("===========================================")
-
-    # 1) Build mapping: folder_path → set of hashes
+    logger.info("=" * 60)
+    logger.info("Folder Similarity Analysis")
+    logger.info("=" * 60)
+    
+    # Validate threshold
     try:
-        folder_hashes = defaultdict(set)
-        for row in db.list_all_photos():
-            folder = str(Path(row["path"]).parent)
-            if row["hash"]:
-                folder_hashes[folder].add(row["hash"])
-        for row in db.list_all_videos():
-            folder = str(Path(row["path"]).parent)
-            if row["hash"]:
-                folder_hashes[folder].add(row["hash"])
-        folders = [k for k in folder_hashes.keys()]
-        results = []
-    except Exception as e:
-        print(f"Build mapping: folder_path → set of hashes: {e}")
-
-    # 2) Compare every folder pair
-    logger.info("Compare folder pairs")
+        threshold = validate_threshold(threshold, 0.0, 1.0)
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+    
+    # Get folder hash mapping
+    folder_hashes = db.get_folder_hash_map()
+    folders = list(folder_hashes.keys())
+    
+    if len(folders) < 2:
+        click.echo("Need at least 2 folders to compare.")
+        db.close()
+        return
+    
+    logger.info(f"Comparing {len(folders)} folders with threshold {threshold}")
+    
+    # Compare all folder pairs
+    results = []
     for i in range(len(folders)):
         for j in range(i + 1, len(folders)):
             f1, f2 = folders[i], folders[j]
             s1, s2 = folder_hashes[f1], folder_hashes[f2]
-
+            
             if not s1 or not s2:
                 continue
-
+            
             intersection = len(s1 & s2)
             union = len(s1 | s2)
             score = intersection / union if union else 0
-
+            
             if score >= threshold:
                 results.append((f1, f2, score, intersection, union))
-
-    # 3) Log results
+    
+    # Display results
     if not results:
-        logger.info(f"No similar folders found (threshold={threshold}).")
+        logger.info(f"No similar folders found (threshold={threshold})")
+        click.echo(f"No similar folders found with similarity >= {threshold}")
+    else:
+        logger.info("")
+        logger.info(f"Found {len(results)} similar folder pairs:")
+        logger.info("")
+        
+        max_len = max(len(f) for f in folders)
+        
+        for f1, f2, score, inter, uni in sorted(results, key=lambda x: -x[2]):
+            logger.info(
+                f"{f1.ljust(max_len)} <-> {f2.ljust(max_len)} | "
+                f"Similarity: {score:.3f} ({inter}/{uni} shared)"
+            )
+        
+        click.echo(f"\nFound {len(results)} similar folder pairs")
+    
+    # Export to CSV
+    if export and results:
+        try:
+            export_path = Path(export)
+            with open(export_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["folder1", "folder2", "similarity", "intersection", "union"])
+                for f1, f2, score, inter, uni in results:
+                    writer.writerow([f1, f2, f"{score:.4f}", inter, uni])
+            
+            logger.info(f"Similarity report exported to {export_path}")
+            click.echo(f"Report exported to: {export_path}")
+        except Exception as e:
+            logger.error(f"Failed to export report: {e}")
+            click.echo(f"Error: Failed to export report: {e}", err=True)
+    
+    db.close()
+
+
+# ==============================================================================================
+# List Command
+# ==============================================================================================
+
+@main.command()
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
+@click.option("--type", "file_type", type=click.Choice(["all", "photos", "videos"]),
+              default="all", show_default=True,
+              help="Type of files to list")
+@click.option("--limit", type=int, default=None,
+              help="Maximum number of files to display")
+@click.pass_context
+def list_files(ctx, db_path, file_type, limit):
+    """
+    List all files in database.
+    
+    Example:
+        photo-dedup list --type photos --limit 100
+    """
+    db = get_database(ctx, db_path)
+    
+    # Get files based on type
+    if file_type == "photos":
+        rows = db.list_all_photos()
+    elif file_type == "videos":
+        rows = db.list_all_videos()
+    else:
+        rows = db.list_all()
+    
+    if not rows:
+        click.echo("No files found in database.")
+        db.close()
         return
+    
+    # Apply limit
+    if limit:
+        rows = rows[:limit]
+    
+    # Display files
+    click.echo(f"\n{'ID':>6} | {'Size':>12} | {'Path'}")
+    click.echo("-" * 80)
+    
+    for r in rows:
+        click.echo(f"{r['id']:6} | {human_size(r['size']):>12} | {r['path']}")
+    
+    click.echo(f"\nTotal: {len(rows)} files")
+    
+    db.close()
 
-    logger.info("")
-    logger.info(f"=== Similar Folders (threshold = {threshold}) ===")
-    logger.info("")
 
-    max_len = max(len(f) for f in folders)
+# ==============================================================================================
+# Report Command
+# ==============================================================================================
 
-    for f1, f2, score, inter, uni in sorted(results, key=lambda x: -x[2]):
-        logger.info(f"{f1.ljust(max_len)} <--> {f2.ljust(max_len)} | "
-                    f"Similarity: {score:.3f} ({inter}/{uni} shared hashes)")
-
-    logger.info("")
-    logger.info("===========================================")
-    logger.info("=== Folder Similarity Analysis Finished ===")
-    logger.info("===========================================")
-
-    # 4) Export if needed
-    if export:
-        export_path = Path(export)
-        with open(export_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["folder1", "folder2", "similarity", "intersection", "union"])
-            for f1, f2, score, inter, uni in results:
-                writer.writerow([f1, f2, score, inter, uni])
-
-        logger.info(f"Similarity report exported to {export_path}")
-
-#==============================================================================================
-# List
-#==============================================================================================
 @main.command()
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
 @click.pass_context
-def list(ctx, db_path):
-    """List all files in DB."""
-    db = Database(db_path)
-    photos_rows = db.list_all_photos()
-    videos_rows = db.list_all_videos()
-
-    logger.info(f"Photos : {photos_rows.count()} : files")
-    for r in photos_rows:
-        logger.info(f"{r['id']:6} | {human_size(r['size']):10} | {r['path']}")
-
-    logger.info(f"Photos : {videos_rows.count()} : files")
-    for r in videos_rows:
-        logger.info(f"{r['id']:6} | {human_size(r['size']):10} | {r['path']}")
-
-#==============================================================================================
-# Report
-#==============================================================================================
-@main.command()
-@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False), help="Path for DB (current directory if not specified)")
-@click.option("--no-file-log", is_flag=True, help="Disable file logging")
-@click.pass_context
-def report(ctx, db_path, no_file_log):
-    """Show global and per-folder duplicate statistics for photos and videos."""
-
-    from logger_setup import setup_logger
-    from db import Database
-    from utils import human_size
-
-    db = Database(db_path)
-
-    global logger
-    logger = setup_logger(db_path=db.db_path, no_file_log=no_file_log)
-
+def report(ctx, db_path):
+    """
+    Show comprehensive duplicate statistics.
+    
+    Displays global and per-folder statistics including:
+    - Total files and sizes
+    - Duplicate counts
+    - Wasted space estimates
+    
+    Example:
+        photo-dedup report
+    """
+    db = get_database(ctx, db_path)
+    setup_logging(ctx, db_path=db.db_path, no_file_log=ctx.obj.get("no_file_log", False))
+    
     logger.info("")
-    logger.info("====================================")
-    logger.info("          DEDUP REPORT")
-    logger.info("====================================")
-
-    # --- Global statistics ---
+    logger.info("=" * 60)
+    logger.info("          DEDUPLICATION REPORT")
+    logger.info("=" * 60)
+    
+    # Global statistics
     stats = db.get_global_stats()
+    
+    logger.info("")
     logger.info("=== Global Statistics ===")
     logger.info(f"Photos:              {str(stats['total_files_photos']).rjust(7)} files")
-    logger.info(f"  Total size:        {human_size(stats['total_size_photos']).rjust(10)}")
+    logger.info(f"  Total size:        {human_size(stats['total_size_photos']).rjust(12)}")
     logger.info(f"  Duplicate groups:  {str(stats['duplicate_photo_groups']).rjust(7)}")
-    logger.info(f"  Lost space:        {human_size(stats['lost_space_photos']).rjust(10)}")
-    logger.info(f"Videos:              {str(stats['total_files_videos']).rjust(7)} files")
-    logger.info(f"  Total size:        {human_size(stats['total_size_videos']).rjust(10)}")
-    logger.info(f"  Duplicate groups:  {str(stats['duplicate_video_groups']).rjust(7)}")
-    logger.info(f"  Lost space:        {human_size(stats['lost_space_videos']).rjust(10)}")
+    logger.info(f"  Wasted space:      {human_size(stats['lost_space_photos']).rjust(12)}")
     logger.info("")
-
-    # --- Per-folder statistics ---
+    logger.info(f"Videos:              {str(stats['total_files_videos']).rjust(7)} files")
+    logger.info(f"  Total size:        {human_size(stats['total_size_videos']).rjust(12)}")
+    logger.info(f"  Duplicate groups:  {str(stats['duplicate_video_groups']).rjust(7)}")
+    logger.info(f"  Wasted space:      {human_size(stats['lost_space_videos']).rjust(12)}")
+    logger.info("")
+    
+    # Per-folder statistics
     folder_stats = db.get_folders_stats()
+    
     if not folder_stats:
         logger.info("No folders found in database.")
-        return
-
-    logger.info("=== Per-folder Statistics ===")
-    max_len = max(len(f) for f in folder_stats.keys())
-
-    for folder, info in sorted(folder_stats.items()):
-        logger.info(
-            f"{folder.ljust(max_len)}  |  "
-            f"Photos: {info['photos_count']:5}  |  "
-            f"Photos Dups: {info['photos_dup_count']:5}  |  "
-            f"Photos Lost: {human_size(info['photos_lost_bytes']):8}  |  "
-            f"Videos: {info['videos_count']:5}  |  "
-            f"Videos Dups: {info['videos_dup_count']:5}  |  "
-            f"Videos Lost: {human_size(info['videos_lost_bytes']):8}  |  "
-        )
+    else:
+        logger.info("=== Per-Folder Statistics ===")
+        max_len = max(len(f) for f in folder_stats.keys())
+        
+        logger.info(f"{'Folder'.ljust(max_len)} | {"Photos".rjust(6)} | {"Dups".rjust(6)} | {"Wasted".rjust(9)} | {"Videos".rjust(6)} | {"Dups".rjust(6)} | {"Wasted".rjust(9)}")
+        logger.info("-" * (max_len + 60))
+        
+        for folder, info in sorted(folder_stats.items()):
+            logger.info(
+                f"{folder.ljust(max_len)} | "
+                f"{str(info['photos_count']).rjust(6)} | "
+                f"{str(info['photos_dup_count']).rjust(6)} | "
+                f"{human_size(info['photos_lost_bytes']).rjust(8)} | "
+                f"{str(info['videos_count']).rjust(6)} | "
+                f"{str(info['videos_dup_count']).rjust(6)} | "
+                f"{human_size(info['videos_lost_bytes']).rjust(8)}"
+            )
+    
     logger.info("")
-    logger.info("====================================")
-    logger.info("            REPORT END")
-    logger.info("====================================")
+    logger.info("=" * 60)
+    logger.info("            END OF REPORT")
+    logger.info("=" * 60)
+    
+    # Also print to console
+    total_wasted = stats['lost_space_photos'] + stats['lost_space_videos']
+    total_dups = stats['duplicate_photo_groups'] + stats['duplicate_video_groups']
+    
+    logger.info(f"Summary:")
+    logger.info(f"  Total duplicate groups: {total_dups}")
+    logger.info(f"  Total wasted space: {human_size(total_wasted)}")
+    
+    db.close()
 
 
+# ==============================================================================================
+# Vacuum Command (New)
+# ==============================================================================================
+
+@main.command()
+@click.option("--db-path", type=click.Path(dir_okay=True, file_okay=False),
+              help="Directory containing database")
+@click.pass_context
+def vacuum(ctx, db_path):
+    """
+    Optimize database by reclaiming unused space.
+    
+    Run this after deleting many files to reduce database size.
+    
+    Example:
+        photo-dedup vacuum
+    """
+    db = get_database(ctx, db_path)
+    
+    size_before = db.get_database_size()
+    click.echo(f"Database size before: {human_size(size_before)}")
+    
+    try:
+        db.vacuum()
+        size_after = db.get_database_size()
+        saved = size_before - size_after
+        
+        click.echo(f"Database size after:  {human_size(size_after)}")
+        click.echo(f"Space reclaimed:      {human_size(saved)}")
+    except Exception as e:
+        click.echo(f"Error: Failed to vacuum database: {e}", err=True)
+        sys.exit(1)
+    
+    db.close()
+
+
+# ==============================================================================================
+# Entry Point
+# ==============================================================================================
 
 if __name__ == "__main__":
-    main()
+    main(obj={})
